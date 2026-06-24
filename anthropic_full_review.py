@@ -6,7 +6,7 @@ Streams large files line-by-line. Parses all JSON. Inserts into DB.
 
 Usage: python3 anthropic_full_review.py [--db ~/Desktop/praxis_forensics.db]
 """
-import os, sys, json, re, hashlib, sqlite3, subprocess, csv, io
+import os, sys, json, re, hashlib, sqlite3, csv
 from pathlib import Path
 from datetime import datetime, timezone
 from collections import defaultdict
@@ -17,6 +17,7 @@ def h(data): return hashlib.sha256(str(data).encode()).hexdigest()
 # ─── Paths ──────────────────────────────────────────────────────────────────
 BASE = Path.home() / "Desktop" / "Anthropic Forensics"
 DB_PATH = Path.home() / "Desktop" / "praxis_forensics.db"
+
 DESTRUCTIVE_PATTERNS = [
     (r"rm\s+-rf\s+[/~]", "CRITICAL", "rm-rf-root"), (r"rm\s+-rf\s+['\"]?/[a-zA-Z]", "CRITICAL", "rm-rf-drive"),
     (r"Remove-Item\s+-Recurse\s+-Force", "CRITICAL", "powershell-rm-force"), (r"diskpart\s+.*clean", "CRITICAL", "diskpart-clean"),
@@ -29,7 +30,6 @@ DESTRUCTIVE_PATTERNS = [
     (r"cacls\s+.*deny", "CRITICAL", "cacls-deny"), (r"attrib\s+-[rhs]", "HIGH", "attrib-hide-system"),
     (r"dd\s+if=/dev/zero", "CRITICAL", "dd-wipe"), (r"shred\s+-[uz]", "CRITICAL", "shred"),
     (r"wipefs", "CRITICAL", "wipefs"), (r"mkfs\.", "CRITICAL", "mkfs-filesystem"),
-    (r">\s*\S+:\\\\.*\.\w+", "HIGH", "redirection-overwrite"),
 ]
 ATTACK_KEYWORDS = {
     "api_key_deception": [r"never saved", r"api key.*(?:not saved|lost|deleted)", r"(?:don't|didn't) save"],
@@ -51,8 +51,7 @@ KW_RE = {cat: [re.compile(p, re.I) for p in ps] for cat, ps in ATTACK_KEYWORDS.i
 # ─── DB Helpers ─────────────────────────────────────────────────────────────
 
 def db_connect():
-    conn = sqlite3.connect(str(DB_PATH))
-    return conn
+    return sqlite3.connect(str(DB_PATH))
 
 def get_ids(conn):
     c = conn.cursor()
@@ -87,25 +86,92 @@ def insert_doc(conn, did, aid, filepath, source, doc_type="export", desc=""):
         (aid, "INSERT", "documents", did, json.dumps({"source": source}), now, ZERO_HASH, h(f"audit:doc:{did}")))
     return did + 1, aid + 1
 
-# ─── File Processors ────────────────────────────────────────────────────────
+# ─── Claude Message Extraction ──────────────────────────────────────────────
 
-def process_conversations_json(conn, eid, did, aid, filepath):
-    """Parse conversations.json completely - stream if large."""
-    size_mb = os.path.getsize(filepath) / (1024**2)
-    print(f"\n  Parsing conversations.json ({size_mb:.1f} MB)...")
+def _extract_claude_messages(conv):
+    msgs = []
+    for key in ["chat_messages", "messages", "conversation"]:
+        arr = conv.get(key)
+        if isinstance(arr, list):
+            for m in arr:
+                if isinstance(m, dict):
+                    s = m.get("sender", m.get("role", m.get("author", "?")))
+                    t = m.get("text", m.get("content", m.get("message", "")))
+                    if t: msgs.append((s, str(t)))
+            return msgs
+    return msgs
+
+def _search_conv_text(conn, eid, aid, did, text_full, conv_name, ai_actor="claude"):
+    """Search a conversation's text for destructive commands and keywords. Insert matches into DB."""
+    text = text_full.lower()
     
-    did, aid = insert_doc(conn, did, aid, str(filepath), "Anthropic Claude Export", "claude_export",
+    # Destructive patterns
+    for pat, sev, dnm in DEST_RE:
+        m = pat.search(text)
+        if m:
+            ctx = text_full[max(0,m.start()-300):m.end()+300]
+            desc = f"[{sev}] {dnm}\nConv: {conv_name}\nContext: {ctx[:500]}"
+            eid, aid = insert_event(conn, eid, aid, did, f"[{sev}] {dnm}", desc, "incident", ai_actor)
+            break
+    
+    # Keywords
+    for cat, patterns in KW_RE.items():
+        matched = False
+        for pat in patterns:
+            m = pat.search(text)
+            if m:
+                ctx = text_full[max(0,m.start()-200):m.end()+200]
+                desc = f"[{cat}]\nConv: {conv_name}\nContext: {ctx[:400]}"
+                eid, aid = insert_event(conn, eid, aid, did, f"{cat}: {conv_name[:40]}", desc, KW_TYPES.get(cat, "finding"), ai_actor)
+                matched = True
+                break
+        if matched:
+            break
+    
+    return eid, aid
+
+# ─── JSON Processors ────────────────────────────────────────────────────────
+
+def process_conversations_json(conn, eid, did, aid, filepath, ai_actor="claude"):
+    size_mb = os.path.getsize(filepath) / (1024**2)
+    print(f"\n  Parsing: {filepath.name} ({size_mb:.1f} MB)")
+    
+    did, aid = insert_doc(conn, did, aid, str(filepath), f"Anthropic Claude Export ({filepath.name})", "claude_export",
         f"Claude conversations.json: {size_mb:.1f} MB")
     conn.commit()
     
-    if size_mb > 100:
-        # Stream-parse large file
-        return _stream_parse_large_json(conn, eid, did, aid, filepath)
-    else:
-        # Normal parse for smaller file
-        return _parse_json_normal(conn, eid, did, aid, filepath)
-
-def _parse_json_normal(conn, eid, did, aid, filepath):
+    start_eid = eid
+    
+    # Try ijson for large files
+    if size_mb > 50:
+        try:
+            import ijson
+            print("    Using ijson streaming...")
+            total_convs = 0
+            total_msgs = 0
+            with open(filepath, 'rb') as f:
+                for conv in ijson.items(f, 'item'):
+                    if not isinstance(conv, dict):
+                        continue
+                    total_convs += 1
+                    msgs = _extract_claude_messages(conv)
+                    if not msgs:
+                        continue
+                    total_msgs += len(msgs)
+                    text_full = "\n".join(f"{r}: {t}" for r, t in msgs)
+                    conv_name = conv.get("name", conv.get("uuid", f"conv_{total_convs}"))[:80]
+                    eid, aid = _search_conv_text(conn, eid, aid, did, text_full, conv_name, ai_actor)
+                    if total_convs % 200 == 0:
+                        conn.commit()
+                        print(f"      {total_convs:,} convs, {eid-start_eid} events...", end='\r')
+            conn.commit()
+            print(f"\n    -> {total_convs:,} conversations, {total_msgs:,} messages, {eid-start_eid} events inserted")
+            return eid, aid
+        except ImportError:
+            print("    ijson not installed. Using standard json (slower for large files).")
+            print("    Tip: pip3 install ijson for faster streaming")
+    
+    # Standard parse
     with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
         data = json.load(f)
     
@@ -122,121 +188,27 @@ def _parse_json_normal(conn, eid, did, aid, filepath):
             continue
         total_msgs += len(msgs)
         text_full = "\n".join(f"{r}: {t}" for r, t in msgs)
-        text = text_full.lower()
         conv_name = conv.get("name", conv.get("uuid", f"conv_{i}"))[:80]
-        
-        # Search destructive
-        for pat, sev, dnm in DEST_RE:
-            m = pat.search(text)
-            if m:
-                ctx = text_full[max(0,m.start()-300):m.end()+300]
-                desc = f"[{sev}] {dnm}\nConv: {conv_name}\nContext: {ctx[:500]}"
-                eid, aid = insert_event(conn, eid, aid, did, f"Claude [{sev}] {dnm}", desc, "incident", "claude")
-                break
-        
-        # Search keywords
-        for cat, patterns in KW_RE.items():
-            for pat in patterns:
-                if pat.search(text):
-                    ctx = text_full[max(0,pat.search(text).start()-200):pat.search(text).end()+200]
-                    desc = f"[{cat}]\nConv: {conv_name}\nContext: {ctx[:400]}"
-                    eid, aid = insert_event(conn, eid, aid, did, f"Claude {cat}: {conv_name[:40]}", desc, KW_TYPES.get(cat, "finding"), "claude")
-                    break
-        
-        if (i+1) % 100 == 0:
+        eid, aid = _search_conv_text(conn, eid, aid, did, text_full, conv_name, ai_actor)
+        if (i+1) % 200 == 0:
             conn.commit()
-            print(f"    Processed {i+1}/{len(data)} conversations...")
+            print(f"      {i+1}/{len(data)} conversations...", end='\r')
     
     conn.commit()
-    print(f"    -> {len(data)} conversations, {total_msgs} messages, events {eid-start_eid if 'start_eid' in dir() else 'N/A'}")
+    print(f"\n    -> {len(data)} conversations, {total_msgs} messages, {eid-start_eid} events inserted")
     return eid, aid
 
-def _stream_parse_large_json(conn, eid, did, aid, filepath):
-    """For very large JSON, use ijson streaming if available, else chunk."""
-    try:
-        import ijson
-        print("    Using ijson streaming parser...")
-        return _ijson_parse(conn, eid, did, aid, filepath)
-    except ImportError:
-        print("    ijson not available. Using chunked line parser...")
-        return _chunked_json_parse(conn, eid, did, aid, filepath)
-
-def _ijson_parse(conn, eid, did, aid, filepath):
-    import ijson
-    total_convs = 0
-    total_msgs = 0
-    
-    with open(filepath, 'rb') as f:
-        for conv in ijson.items(f, 'item'):
-            if not isinstance(conv, dict):
-                continue
-            total_convs += 1
-            msgs = _extract_claude_messages(conv)
-            if not msgs:
-                continue
-            total_msgs += len(msgs)
-            text_full = "\n".join(f"{r}: {t}" for r, t in msgs)
-            text = text_full.lower()
-            conv_name = conv.get("name", conv.get("uuid", f"conv_{total_convs}"))[:80]
-            
-            for pat, sev, dnm in DEST_RE:
-                m = pat.search(text)
-                if m:
-                    ctx = text_full[max(0,m.start()-300):m.end()+300]
-                    desc = f"[{sev}] {dnm}\nConv: {conv_name}\nContext: {ctx[:500]}"
-                    eid, aid = insert_event(conn, eid, aid, did, f"Claude [{sev}] {dnm}", desc, "incident", "claude")
-                    break
-            
-            for cat, patterns in KW_RE.items():
-                matched = False
-                for pat in patterns:
-                    m = pat.search(text)
-                    if m:
-                        ctx = text_full[max(0,m.start()-200):m.end()+200]
-                        desc = f"[{cat}]\nConv: {conv_name}\nContext: {ctx[:400]}"
-                        eid, aid = insert_event(conn, eid, aid, did, f"Claude {cat}: {conv_name[:40]}", desc, KW_TYPES.get(cat, "finding"), "claude")
-                        matched = True
-                        break
-                if matched:
-                    break
-            
-            if total_convs % 100 == 0:
-                conn.commit()
-                print(f"    Processed {total_convs} conversations...", end='\r')
-    
-    conn.commit()
-    print(f"\n    -> {total_convs} conversations, {total_msgs} messages")
-    return eid, aid
-
-def _chunked_json_parse(conn, eid, did, aid, filepath):
-    """Fallback: Parse JSON in chunks for memory efficiency."""
-    print("    NOTE: Install ijson for faster streaming: pip3 install ijson")
-    print("    Falling back to standard json.load() - this may take time for 780 MB...")
-    return _parse_json_normal(conn, eid, did, aid, filepath)
-
-def _extract_claude_messages(conv):
-    """Extract messages from Claude conversation format."""
-    msgs = []
-    for key in ["chat_messages", "messages", "conversation"]:
-        arr = conv.get(key)
-        if isinstance(arr, list):
-            for m in arr:
-                if isinstance(m, dict):
-                    s = m.get("sender", m.get("role", m.get("author", "?")))
-                    t = m.get("text", m.get("content", m.get("message", "")))
-                    if t: msgs.append((s, str(t)))
-            return msgs
-    return msgs
+# ─── Text File Streamer ─────────────────────────────────────────────────────
 
 def stream_text_file(conn, eid, did, aid, filepath, source_label, ai_actor="claude"):
-    """Stream-process a large text file line by line."""
     size_gb = os.path.getsize(filepath) / (1024**3)
     print(f"\n  Streaming: {filepath.name} ({size_gb:.2f} GB)")
     
     did, aid = insert_doc(conn, did, aid, str(filepath), source_label, "forensic_extract",
-        f"Streamed text analysis: {filepath.name}")
+        f"Streamed text: {filepath.name}")
     conn.commit()
     
+    start_eid = eid
     line_count = 0
     matches = defaultdict(int)
     
@@ -245,11 +217,11 @@ def stream_text_file(conn, eid, did, aid, filepath, source_label, ai_actor="clau
             line_count += 1
             text = line.lower()
             
-            # Destructive patterns
+            # Destructive
             for pat, sev, dnm in DEST_RE:
                 if pat.search(text):
                     ctx = line[:500]
-                    desc = f"[{sev}] {dnm}\nLine {line_count}: {ctx[:400]}"
+                    desc = f"[{sev}] {dnm}\nLine {line_count:,}: {ctx[:400]}"
                     eid, aid = insert_event(conn, eid, aid, did, f"{source_label} [{sev}] {dnm}", desc, "incident", ai_actor)
                     matches[f"{sev}_{dnm}"] += 1
                     break
@@ -260,7 +232,7 @@ def stream_text_file(conn, eid, did, aid, filepath, source_label, ai_actor="clau
                 for pat in patterns:
                     if pat.search(text):
                         ctx = line[:400]
-                        desc = f"[{cat}]\nLine {line_count}: {ctx[:350]}"
+                        desc = f"[{cat}]\nLine {line_count:,}: {ctx[:350]}"
                         eid, aid = insert_event(conn, eid, aid, did, f"{source_label} {cat}", desc, KW_TYPES.get(cat, "finding"), ai_actor)
                         matches[cat] += 1
                         matched = True
@@ -270,23 +242,24 @@ def stream_text_file(conn, eid, did, aid, filepath, source_label, ai_actor="clau
             
             if line_count % 100000 == 0:
                 conn.commit()
-                print(f"    Lines: {line_count:,}...", end='\r')
+                print(f"      {line_count:,} lines, {eid-start_eid} events...", end='\r')
     
     conn.commit()
-    print(f"\n    -> {line_count:,} lines processed, {len(matches)} match types")
+    print(f"\n    -> {line_count:,} lines, {eid-start_eid} events inserted")
     for k, v in sorted(matches.items(), key=lambda x: -x[1]):
         print(f"      {k}: {v}")
     return eid, aid
 
+# ─── TSV Processor ──────────────────────────────────────────────────────────
+
 def process_tsv_file(conn, eid, did, aid, filepath):
-    """Process TSV inventory files - extract file paths and flag suspicious entries."""
-    print(f"\n  Processing TSV: {filepath.name}")
+    print(f"\n  TSV: {filepath.name}")
     
     did, aid = insert_doc(conn, did, aid, str(filepath), "Forensic Inventory TSV", "inventory",
-        f"TSV file listing: {filepath.name}")
+        f"TSV: {filepath.name}")
     conn.commit()
     
-    suspicious = 0
+    start_eid = eid
     line_count = 0
     
     with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
@@ -295,32 +268,33 @@ def process_tsv_file(conn, eid, did, aid, filepath):
             line_count += 1
             if not row:
                 continue
-            # Check for suspicious paths in any column
             row_text = "\t".join(row).lower()
             for pat, sev, dnm in DEST_RE:
                 if pat.search(row_text):
                     path = row[0] if row else "unknown"
                     desc = f"[{sev}] {dnm}\nPath: {path}\nRow: {row_text[:300]}"
                     eid, aid = insert_event(conn, eid, aid, did, f"TSV [{sev}] {dnm}", desc, "incident", "claude")
-                    suspicious += 1
                     break
-            
             if line_count % 50000 == 0:
                 conn.commit()
-                print(f"    Rows: {line_count:,}...", end='\r')
+                print(f"      {line_count:,} rows...", end='\r')
     
     conn.commit()
-    print(f"\n    -> {line_count:,} rows, {suspicious} suspicious entries")
+    print(f"\n    -> {line_count:,} rows, {eid-start_eid} events")
     return eid, aid
 
-def run_shell_scripts(conn, eid, did, aid):
-    """Execute forensic shell scripts and capture output."""
+# ─── Shell Script Processor ─────────────────────────────────────────────────
+
+def process_shell_scripts(conn, eid, did, aid):
     scripts = [
-        ("EXTRACT_ORIGINAL_19GB_WIPE_RECORDS.sh", "19GB Wipe Record Extractor"),
+        ("EXTRACT_ORIGINAL_19GB_WIPE_RECORDS.sh", "19GB Wipe Extractor"),
         ("check_evidence_drive.sh", "Evidence Drive Checker"),
         ("forensic_analysis.sh", "Forensic Analysis"),
         ("forensic_analysis_enhanced.sh", "Enhanced Forensic Analysis"),
+        ("forensic_analysis_d_drive.sh", "D-Drive Forensic Analysis"),
         ("run_forensic_context_scan.sh", "Context Scanner"),
+        ("run_drive_fetcher.sh", "Drive Fetcher"),
+        ("search-windows-evidence-drive-readonly.sh", "Windows Evidence Scan"),
     ]
     
     for script_name, label in scripts:
@@ -328,33 +302,53 @@ def run_shell_scripts(conn, eid, did, aid):
         if not script_path.exists():
             continue
         
-        print(f"\n  Executing: {script_name}")
-        did, aid = insert_doc(conn, did, aid, str(script_path), label, "forensic_script",
-            f"Executed forensic script: {script_name}")
+        print(f"\n  Script: {script_name}")
+        did_script, aid = insert_doc(conn, did, aid, str(script_path), label, "forensic_script",
+            f"Forensic script: {script_name}")
         conn.commit()
         
-        # Read script content as evidence
         try:
             with open(script_path, 'r') as f:
                 content = f.read()
             
-            # Search script content for destructive patterns
             text = content.lower()
             for pat, sev, dnm in DEST_RE:
                 m = pat.search(text)
                 if m:
                     ctx = content[max(0,m.start()-200):m.end()+200]
                     desc = f"Script: {script_name}\n[{sev}] {dnm}\nContext: {ctx[:400]}"
-                    eid, aid = insert_event(conn, eid, aid, did, f"Script [{sev}] {dnm}", desc, "incident", "claude")
+                    eid, aid = insert_event(conn, eid, aid, did_script, f"Script [{sev}] {dnm}", desc, "incident", "claude")
             
-            # Record script execution
-            desc = f"Script: {script_name}\nSize: {len(content)} chars\nFirst 500 chars:\n{content[:500]}"
-            eid, aid = insert_event(conn, eid, aid, did, f"Script executed: {script_name}", desc, "system_action", "claude")
+            desc = f"Script: {script_name}\nSize: {len(content):,} chars\nFirst 500 chars:\n{content[:500]}"
+            eid, aid = insert_event(conn, eid, aid, did_script, f"Script: {script_name}", desc, "system_action", "claude")
             
         except Exception as e:
-            print(f"    Error reading script: {e}")
+            print(f"    Error: {e}")
     
     conn.commit()
+    return eid, aid
+
+# ─── Document Cataloger ─────────────────────────────────────────────────────
+
+def catalog_documents(conn, eid, did, aid, exclude_files):
+    print("\n\n=== CATALOGING DOCUMENTS ===")
+    doc_exts = {'.pdf', '.docx', '.doc', '.md', '.txt', '.html', '.csv', '.rtf'}
+    docs = [d for d in BASE.rglob("*") if d.is_file() and d.suffix.lower() in doc_exts and d not in exclude_files]
+    docs.sort(key=lambda x: os.path.getsize(x), reverse=True)
+    
+    count = 0
+    for df in docs[:100]:  # Top 100 by size
+        size_kb = os.path.getsize(df) / 1024
+        if size_kb < 1:
+            continue
+        rel = str(df.relative_to(BASE))
+        did, aid = insert_doc(conn, did, aid, str(df), "Anthropic Forensics Document", "document", rel)
+        count += 1
+        if count % 10 == 0:
+            conn.commit()
+    
+    conn.commit()
+    print(f"  Cataloged {count} documents")
     return eid, aid
 
 # ─── Main ───────────────────────────────────────────────────────────────────
@@ -374,43 +368,65 @@ def main():
     eid, did, aid = get_ids(conn)
     start_eid = eid
     print(f"  Starting event ID: {eid}")
+    print(f"  Starting doc ID: {did}")
     
-    # 1. Parse main conversations.json (780.5 MB)
+    exclude_files = set()
+    
+    # 1. Main conversations.json (780.5 MB)
     conv_main = BASE / "anthropic-claude-project-upload" / "source-record" / "conversations.json"
     if conv_main.exists():
-        eid, aid = process_conversations_json(conn, eid, did, aid, str(conv_main))
+        eid, aid = process_conversations_json(conn, eid, did, aid, str(conv_main), "claude")
+        exclude_files.add(conv_main)
     
-    # 2. Parse batch conversations.json (12.6 MB)
+    # 2. Batch conversations.json (12.6 MB)
     conv_batch = BASE / "data-faf9ed85-ed03-43d1-941c-a6beac037aa9-1781610889-94032702-batch-0000" / "conversations.json"
     if conv_batch.exists():
-        eid, aid = process_conversations_json(conn, eid, did, aid, str(conv_batch))
+        eid, aid = process_conversations_json(conn, eid, did, aid, str(conv_batch), "claude")
+        exclude_files.add(conv_batch)
     
-    # 3. Stream sandbox guard hits (5.87 GB)
+    # 3. Sandbox guard hits (5.87 GB)
     sb_file = BASE / "FORENSIC_CONTEXT_SCAN_20260618_120232" / "02_sandbox_guard_hits.txt"
     if sb_file.exists():
-        eid, aid = stream_text_file(conn, eid, did, aid, sb_file, "Claude Sandbox Guard Hit")
+        eid, aid = stream_text_file(conn, eid, did, aid, sb_file, "Claude Sandbox Guard", "claude")
+        exclude_files.add(sb_file)
     
-    # 4. Stream network attribution (1.88 GB)
+    # 4. Network attribution (1.88 GB)
     net_file = BASE / "macos-network-attribution-upload-20260611-004755" / "network-focused-all-retained-history-filtered.txt"
     if net_file.exists():
-        eid, aid = stream_text_file(conn, eid, did, aid, net_file, "macOS Network Attribution")
+        eid, aid = stream_text_file(conn, eid, did, aid, net_file, "macOS Network Attribution", "claude")
+        exclude_files.add(net_file)
     
-    # 5. Stream key term hits (928 MB)
+    # 5. Key term hits (928 MB)
     kt_file = BASE / "claude-session-pivot-review-20260611-103422" / "CLAUDE-SESSION-KEY-TERM-HITS.txt"
     if kt_file.exists():
-        eid, aid = stream_text_file(conn, eid, did, aid, kt_file, "Claude Session Key Term Hit")
+        eid, aid = stream_text_file(conn, eid, did, aid, kt_file, "Claude Key Term Hit", "claude")
+        exclude_files.add(kt_file)
     
-    # 6. Stream wipe context (267 MB)
+    # 6. Wipe context (267 MB)
     wipe_file = BASE / "original-19gb-wipe-records-20260611-113421" / "ORIGINAL_19GB_WIPE_CONTEXT.txt"
     if wipe_file.exists():
-        eid, aid = stream_text_file(conn, eid, did, aid, wipe_file, "19GB Wipe Context")
+        eid, aid = stream_text_file(conn, eid, did, aid, wipe_file, "19GB Wipe Context", "claude")
+        exclude_files.add(wipe_file)
     
-    # 7. Stream Windows execution trace (776 MB)
+    # 7. Windows execution trace (776 MB)
     trace_file = BASE / "windows-trace-review-20260611-013340" / "CLAUDE_EXEC_TRACE_TARGETED_HITS_UTF8.txt"
     if trace_file.exists():
-        eid, aid = stream_text_file(conn, eid, did, aid, trace_file, "Windows Execution Trace")
+        eid, aid = stream_text_file(conn, eid, did, aid, trace_file, "Windows Exec Trace", "claude")
+        exclude_files.add(trace_file)
     
-    # 8. Process TSV inventory files
+    # 8. Global agent forensic (808 MB)
+    ga_file = BASE / "GLOBAL_AGENT_FORENSIC_20260618_113915" / "01_sandbox_guard_hits.txt"
+    if ga_file.exists():
+        eid, aid = stream_text_file(conn, eid, did, aid, ga_file, "Global Agent Sandbox", "claude")
+        exclude_files.add(ga_file)
+    
+    # 9. Focused evidence scan (403 MB)
+    fe_file = BASE / "FOCUSED_EVIDENCE_SCAN_20260618_120008" / "01_focused_hits.txt"
+    if fe_file.exists():
+        eid, aid = stream_text_file(conn, eid, did, aid, fe_file, "Focused Evidence Hit", "claude")
+        exclude_files.add(fe_file)
+    
+    # 10. TSV inventory files
     tsv_files = [
         BASE / "FORENSIC_RECON_ANALYSIS_SET_20260618_165810" / "01_ALL_FILES_INVENTORY.tsv",
         BASE / "FORENSIC_RECON_ANALYSIS_SET_20260618_165810" / "03_CRITICAL_FILES.tsv",
@@ -421,25 +437,13 @@ def main():
     for tf in tsv_files:
         if tf.exists():
             eid, aid = process_tsv_file(conn, eid, did, aid, tf)
+            exclude_files.add(tf)
     
-    # 9. Run/record shell scripts
-    eid, aid = run_shell_scripts(conn, eid, did, aid)
+    # 11. Shell scripts
+    eid, aid = process_shell_scripts(conn, eid, did, aid)
     
-    # 10. Process all remaining documents
-    print("\n\n=== PROCESSING REMAINING DOCUMENTS ===")
-    doc_files = list(BASE.rglob("*.pdf")) + list(BASE.rglob("*.docx")) + list(BASE.rglob("*.md")) + list(BASE.rglob("*.txt"))
-    doc_files = [d for d in doc_files if d not in [
-        sb_file, net_file, kt_file, wipe_file, trace_file
-    ] and "15_LIMITATIONS" not in str(d)]
-    
-    for df in sorted(doc_files, key=lambda x: os.path.getsize(x), reverse=True)[:50]:
-        size_kb = os.path.getsize(df) / 1024
-        if size_kb < 1:  # Skip tiny files
-            continue
-        rel = str(df.relative_to(BASE))
-        did, aid = insert_doc(conn, did, aid, str(df), "Anthropic Forensics Document", "document", rel)
-        conn.commit()
-        print(f"  Document: {rel} ({size_kb:.1f} KB)")
+    # 12. Catalog remaining documents
+    eid, aid = catalog_documents(conn, eid, did, aid, exclude_files)
     
     conn.close()
     
@@ -450,10 +454,8 @@ def main():
     print(f"{'='*70}")
     print(f"  Events inserted: {total_inserted}")
     print(f"  Event range: {start_eid} - {eid - 1}")
-    print(f"  Documents cataloged: {did - (did - total_inserted)}")
     print(f"{'='*70}")
     
-    # Save summary
     summary = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "source": "Anthropic Forensics Full Review",
@@ -463,7 +465,7 @@ def main():
     }
     with open(Path.home() / "Desktop" / "anthropic_full_review_summary.json", 'w') as f:
         json.dump(summary, f, indent=2, default=str)
-    print(f"\n  Summary saved: ~/Desktop/anthropic_full_review_summary.json")
+    print(f"\n  Summary: ~/Desktop/anthropic_full_review_summary.json")
 
 if __name__ == "__main__":
     main()
